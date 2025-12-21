@@ -1,6 +1,7 @@
 # Backend de licença / trial (SUAP PGD2 PIT/RIT)
 
 ## Rodar local
+
 ```bash
 cd backend
 cp .env.example .env
@@ -11,6 +12,7 @@ npm start
 Servidor padrão: http://localhost:8787
 
 ## Testar criando licença manual (sem Stripe)
+
 ```bash
 npm run seed -- pro 30
 # copie a LICENSE_KEY e cole no popup/options
