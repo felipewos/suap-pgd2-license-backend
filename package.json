@@ -1,0 +1,16 @@
+{
+  "name": "suap-pgd2-license-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "seed": "node tools/seed.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "stripe": "^16.6.0"
+  }
+}
