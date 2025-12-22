@@ -6,27 +6,90 @@ import { stripe } from "./stripe_client.js";
 
 const app = express();
 
-// CORS: permite chamadas do extension origin + seu domínio do painel/admin
+// importante em produção atrás do Render/Cloudflare
+app.set("trust proxy", 1);
+
+// ---------- CORS (produção) ----------
+function parseAllowlist() {
+  const raw = String(process.env.ORIGIN_ALLOWLIST || "").trim();
+  if (!raw) return { any: true, list: [], allowChromeExtAny: true }; // fallback dev
+  const list = raw.split(",").map(s => s.trim()).filter(Boolean);
+  const allowChromeExtAny = list.includes("chrome-extension://*");
+  const any = list.includes("*");
+  return { any, list, allowChromeExtAny };
+}
+
+const allow = parseAllowlist();
+
 app.use(cors({
-  origin: true,
+  origin: (origin, cb) => {
+    // requests sem Origin (curl/server-to-server)
+    if (!origin) return cb(null, true);
+
+    if (allow.any) return cb(null, true);
+    if (allow.allowChromeExtAny && origin.startsWith("chrome-extension://")) return cb(null, true);
+
+    const ok = allow.list.includes(origin);
+    return cb(ok ? null : new Error("CORS blocked"), ok);
+  },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 app.options("*", cors());
 
+// ---------- Stripe webhook precisa do RAW antes do JSON ----------
+app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), (req, res) => {
+  if (!stripe) return res.status(400).send("Stripe not configured.");
+
+  const sig = req.headers["stripe-signature"];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) return res.status(400).send("Missing STRIPE_WEBHOOK_SECRET");
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const boundUserKey = session.metadata?.boundUserKey;
+    const plan = session.metadata?.plan || "pro";
+
+    const now = serverTimeMs();
+    const endsAtMs = now + 30 * 24 * 60 * 60 * 1000;
+    const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
+
+    createLicense(licenseKey, {
+      status: "active",
+      plan,
+      endsAtMs,
+      boundUserKey
+    });
+
+    if (boundUserKey) ensureTrialForUser(boundUserKey, null);
+  }
+
+  res.json({ received: true });
+});
+
+// depois do webhook, pode JSON normal
 app.use(express.json({ limit: "512kb" }));
 
 function serverTimeMs() { return Date.now(); }
 
 function getTrialDays() {
-  const d = Number(process.env.TRIAL_DAYS || "7");
-  return Number.isFinite(d) && d > 0 ? d : 7;
+  const d = Number(process.env.TRIAL_DAYS ?? "7");
+  // permite 0 para expirar imediatamente
+  if (Number.isFinite(d) && d >= 0) return d;
+  return 7;
 }
 
 function ensureTrialForUser(boundUserKey, boundUserLabel) {
   const existing = getUser(boundUserKey);
-  if (existing?.trialStartedAt && existing?.trialEndsAt) return existing;
+  if (existing?.trialStartedAt && existing?.trialEndsAt != null) return existing;
 
   const now = serverTimeMs();
   const ends = now + getTrialDays() * 24 * 60 * 60 * 1000;
@@ -41,7 +104,7 @@ function computeStatus(boundUserKey, licenseKey) {
   const now = serverTimeMs();
   const u = getUser(boundUserKey) || null;
 
-  const trialEndsAtMs = u?.trialEndsAt || null;
+  const trialEndsAtMs = u?.trialEndsAt ?? null;
   const trialActive = !!trialEndsAtMs && trialEndsAtMs > now;
 
   let license = null;
@@ -57,13 +120,42 @@ function computeStatus(boundUserKey, licenseKey) {
   };
 }
 
-// -------- API --------
+// ---------- Admin auth ----------
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
 
+function requireAdmin(req, res, next) {
+  const key = String(process.env.ADMIN_API_KEY || "").trim();
+
+  // se não setar ADMIN_API_KEY no Render, admin fica DESLIGADO (seguro)
+  if (!key) return res.status(403).json({ error: "admin_disabled" });
+
+  const auth = String(req.get("authorization") || "");
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+
+  // fallback para uso no navegador (menos recomendado): ?key=...
+  const q = String(req.query.key || req.query.adminKey || "").trim();
+
+  const provided = bearer || q;
+  if (!provided) return res.status(401).json({ error: "missing_admin_key" });
+  if (!safeEqual(provided, key)) return res.status(403).json({ error: "bad_admin_key" });
+
+  return next();
+}
+
+// ---------- Rotas úteis ----------
+app.get("/healthz", (req, res) => res.json({ ok: true, ts: serverTimeMs() }));
+
+// -------- API --------
 app.post("/api/auth/bind", (req, res) => {
   const { boundUserKey, boundUserLabel } = req.body || {};
   if (!boundUserKey) return res.status(400).json({ error: "missing boundUserKey" });
 
-  const u = ensureTrialForUser(boundUserKey, boundUserLabel);
+  ensureTrialForUser(boundUserKey, boundUserLabel);
   const status = computeStatus(boundUserKey, null);
   return res.json(status);
 });
@@ -71,8 +163,10 @@ app.post("/api/auth/bind", (req, res) => {
 app.post("/api/trial/status", (req, res) => {
   const { boundUserKey } = req.body || {};
   if (!boundUserKey) return res.status(400).json({ error: "missing boundUserKey" });
+
   const u = getUser(boundUserKey);
   if (!u) return res.status(404).json({ error: "not_found" });
+
   const status = computeStatus(boundUserKey, null);
   return res.json(status);
 });
@@ -87,19 +181,17 @@ app.post("/api/license/verify", (req, res) => {
   const lic = getLicense(licenseKey);
   if (!lic) return res.status(404).json({ error: "license_not_found" });
 
-  // (1) se a licença já está vinculada, só libera para o mesmo usuário
   if (lic.boundUserKey && lic.boundUserKey !== boundUserKey) {
     return res.status(403).json({ error: "license_bound_to_other_user" });
   }
 
-  // (2) se não está vinculada ainda, vincula ao primeiro userKey que verificar
   if (!lic.boundUserKey) bindLicenseToUser(licenseKey, boundUserKey);
 
   const status = computeStatus(boundUserKey, licenseKey);
   return res.json(status);
 });
 
-// Rebind controlado (suporte ou licença + confirmar)
+// Rebind (se você ainda usar; se não usar, pode remover depois)
 app.post("/api/auth/rebind", (req, res) => {
   const { newBoundUserKey, newBoundUserLabel, supportCode, licenseKey, confirmOk } = req.body || {};
   if (!newBoundUserKey) return res.status(400).json({ ok:false, error: "missing newBoundUserKey" });
@@ -122,9 +214,8 @@ app.post("/api/auth/rebind", (req, res) => {
 });
 
 // -------- Checkout (opcional) --------
-// Página simples para iniciar compra. Você pode substituir por front-end próprio.
 app.get("/buy", async (req, res) => {
-  const { boundUserKey, extensionId, plan = "pro", period = "monthly" } = req.query || {};
+  const { boundUserKey, plan = "pro", period = "monthly" } = req.query || {};
   if (!boundUserKey) return res.status(400).send("Missing boundUserKey");
 
   if (!stripe) {
@@ -143,12 +234,13 @@ app.get("/buy", async (req, res) => {
 
   if (!priceId) return res.status(400).send("Missing Stripe price id for selected plan/period.");
 
-  // O "licenseKey" é gerado no webhook (para simplificar). Aqui gravamos boundUserKey em metadata.
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
+
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
     line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${req.protocol}://${req.get("host")}/success`,
-    cancel_url: `${req.protocol}://${req.get("host")}/cancel`,
+    success_url: `${baseUrl}/success`,
+    cancel_url: `${baseUrl}/cancel`,
     metadata: { boundUserKey: String(boundUserKey), plan: String(plan) }
   });
 
@@ -164,47 +256,8 @@ app.get("/success", (req, res) => {
 });
 app.get("/cancel", (req, res) => res.status(200).send("<h2>Cancelado</h2>"));
 
-// Webhook Stripe: ao confirmar, cria/atualiza licença e vincula ao boundUserKey da metadata
-app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), (req, res) => {
-  if (!stripe) return res.status(400).send("Stripe not configured.");
-
-  const sig = req.headers["stripe-signature"];
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret) return res.status(400).send("Missing STRIPE_WEBHOOK_SECRET");
-
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, secret);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  // Mínimo: checkout.session.completed
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    const boundUserKey = session.metadata?.boundUserKey;
-    const plan = session.metadata?.plan || "pro";
-
-    // licença: 30 dias a partir de agora (ajuste conforme seu modelo)
-    const now = serverTimeMs();
-    const endsAtMs = now + 30 * 24 * 60 * 60 * 1000;
-    const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase(); // exemplo
-
-    createLicense(licenseKey, {
-      status: "active",
-      plan,
-      endsAtMs,
-      boundUserKey
-    });
-
-    ensureTrialForUser(boundUserKey, null);
-  }
-
-  res.json({ received: true });
-});
-
-// -------- Seed (manual) --------
-app.get("/admin/create-license", (req, res) => {
+// -------- Seed (manual) - AGORA PROTEGIDO --------
+app.get("/admin/create-license", requireAdmin, (req, res) => {
   const { plan = "pro", days = "30" } = req.query || {};
   const d = Number(days);
   const now = serverTimeMs();
