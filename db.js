@@ -231,13 +231,19 @@ export async function getActiveLicenseForUser(boundUserKey, nowMs = Date.now()) 
     const db = load();
     let best = null;
 
+    const scorePlan = (plan) => (String(plan || "").toLowerCase() === "pro" ? 1 : 0);
+
     for (const [licenseKey, lic] of Object.entries(db.licenses || {})) {
       if (!lic) continue;
       if (lic.boundUserKey !== boundUserKey) continue;
       if (lic.status !== "active") continue;
       if (!lic.endsAtMs || lic.endsAtMs <= nowMs) continue;
 
-      if (!best || lic.endsAtMs > best.endsAtMs) {
+      if (
+        !best ||
+        scorePlan(lic.plan) > scorePlan(best.plan) ||
+        (scorePlan(lic.plan) === scorePlan(best.plan) && lic.endsAtMs > best.endsAtMs)
+      ) {
         best = { licenseKey, ...lic };
       }
     }
@@ -252,7 +258,9 @@ export async function getActiveLicenseForUser(boundUserKey, nowMs = Date.now()) 
       WHERE bound_user_key = $1
         AND status = 'active'
         AND ends_at_ms > $2
-      ORDER BY ends_at_ms DESC
+      ORDER BY
+        CASE WHEN lower(plan) = 'pro' THEN 1 ELSE 0 END DESC,
+        ends_at_ms DESC
       LIMIT 1;
     `,
     [boundUserKey, nowMs]
