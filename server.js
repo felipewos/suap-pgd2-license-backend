@@ -9,7 +9,8 @@ import {
   createLicense,
   bindLicenseToUser,
   getActiveLicenseForUser,
-  markPaymentOnce
+  markPaymentOnce,
+  getStats
 } from "./db.js";
 import { stripe } from "./stripe_client.js";
 
@@ -376,6 +377,12 @@ app.get("/admin/create-license", requireAdmin, async (req, res) => {
 
   await createLicense(licenseKey, { status: "active", plan, endsAtMs, boundUserKey: null });
   return res.json({ licenseKey, plan, endsAtMs });
+});
+
+app.get("/admin/stats", requireAdmin, async (req, res) => {
+  const now = serverTimeMs();
+  const stats = await getStats(now);
+  return res.json({ nowMs: now, ...stats });
 });
 
 const port = Number(process.env.PORT || "8787");

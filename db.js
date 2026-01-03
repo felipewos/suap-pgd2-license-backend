@@ -307,3 +307,74 @@ export async function markPaymentOnce(paymentKey, payload) {
 
   return res.rowCount === 1;
 }
+
+export async function getStats(nowMs = Date.now()) {
+  if (!usePostgres) {
+    const db = load();
+    const users = db.users || {};
+    const licenses = db.licenses || {};
+
+    const usersTotal = Object.keys(users).length;
+    let trialActiveUsers = 0;
+    for (const u of Object.values(users)) {
+      if (u?.trialEndsAt && u.trialEndsAt > nowMs) trialActiveUsers++;
+    }
+
+    const activeLicenses = Object.entries(licenses).filter(([, lic]) =>
+      lic?.status === "active" && lic?.endsAtMs && lic.endsAtMs > nowMs
+    );
+    const licensesTotal = Object.keys(licenses).length;
+    const licensesActive = activeLicenses.length;
+    const paidActiveUsers = new Set(activeLicenses.map(([, lic]) => lic.boundUserKey).filter(Boolean)).size;
+
+    const byPlan = activeLicenses.reduce((acc, [, lic]) => {
+      const p = String(lic?.plan || "unknown").toLowerCase();
+      acc[p] = (acc[p] || 0) + 1;
+      return acc;
+    }, {});
+
+    return {
+      usersTotal,
+      trialActiveUsers,
+      paidActiveUsers,
+      licensesTotal,
+      licensesActive,
+      licensesActiveByPlan: byPlan
+    };
+  }
+
+  await ensurePg();
+
+  const usersTotalRes = await pool.query("SELECT COUNT(*) AS c FROM users");
+  const trialActiveRes = await pool.query(
+    "SELECT COUNT(*) AS c FROM users WHERE trial_ends_at > $1",
+    [nowMs]
+  );
+  const licensesTotalRes = await pool.query("SELECT COUNT(*) AS c FROM licenses");
+  const licensesActiveRes = await pool.query(
+    "SELECT COUNT(*) AS c FROM licenses WHERE status = 'active' AND ends_at_ms > $1",
+    [nowMs]
+  );
+  const paidUsersRes = await pool.query(
+    "SELECT COUNT(DISTINCT bound_user_key) AS c FROM licenses WHERE status = 'active' AND ends_at_ms > $1 AND bound_user_key IS NOT NULL",
+    [nowMs]
+  );
+  const byPlanRes = await pool.query(
+    "SELECT lower(coalesce(plan, 'unknown')) AS plan, COUNT(*) AS c FROM licenses WHERE status = 'active' AND ends_at_ms > $1 GROUP BY 1",
+    [nowMs]
+  );
+
+  const byPlan = {};
+  for (const row of byPlanRes.rows) {
+    byPlan[row.plan] = Number(row.c);
+  }
+
+  return {
+    usersTotal: Number(usersTotalRes.rows[0]?.c || 0),
+    trialActiveUsers: Number(trialActiveRes.rows[0]?.c || 0),
+    paidActiveUsers: Number(paidUsersRes.rows[0]?.c || 0),
+    licensesTotal: Number(licensesTotalRes.rows[0]?.c || 0),
+    licensesActive: Number(licensesActiveRes.rows[0]?.c || 0),
+    licensesActiveByPlan: byPlan
+  };
+}

@@ -26,3 +26,6 @@ Ou via endpoint:
 - Use `DATABASE_URL` para Postgres (JSON so para dev local).
 - Configure CORS allowlist.
 - Configure Stripe (opcional) + webhook.
+
+## Admin
+- GET /admin/stats (total usuarios trial/pago e licencas ativas)
