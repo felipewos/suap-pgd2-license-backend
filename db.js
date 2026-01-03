@@ -87,8 +87,8 @@ function mapUserRow(row) {
   if (!row) return null;
   return {
     boundUserLabel: row.bound_user_label ?? null,
-    trialStartedAt: row.trial_started_at ?? null,
-    trialEndsAt: row.trial_ends_at ?? null
+    trialStartedAt: row.trial_started_at != null ? Number(row.trial_started_at) : null,
+    trialEndsAt: row.trial_ends_at != null ? Number(row.trial_ends_at) : null
   };
 }
 
@@ -97,7 +97,7 @@ function mapLicenseRow(row) {
   return {
     status: row.status ?? null,
     plan: row.plan ?? null,
-    endsAtMs: row.ends_at_ms ?? null,
+    endsAtMs: row.ends_at_ms != null ? Number(row.ends_at_ms) : null,
     boundUserKey: row.bound_user_key ?? null,
     stripe: {
       sessionId: row.stripe_session_id ?? null,
