@@ -29,3 +29,8 @@ Ou via endpoint:
 
 ## Admin
 - GET /admin/stats (total usuarios trial/pago e licencas ativas)
+
+
+## Pix
+- Pix funciona via pagamento unico (sem assinatura).
+- Configure os PRICE IDs *_ONETIME no .env para Pix.

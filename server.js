@@ -49,6 +49,9 @@ app.options("*", cors());
 // ---------- Helpers ----------
 function serverTimeMs() { return Date.now(); }
 function daysMs(d) { return d * 24 * 60 * 60 * 1000; }
+function periodToDays(period) {
+  return String(period || "").toLowerCase() === "yearly" ? 365 : 30;
+}
 
 function getTrialDays() {
   const d = Number(process.env.TRIAL_DAYS ?? "7");
@@ -116,7 +119,7 @@ async function processCheckoutSession(session, { force = false } = {}) {
     if (!marked) return { ok: true, duplicate: true };
   }
 
-  let endsAtMs = serverTimeMs() + daysMs(30);
+  let endsAtMs = serverTimeMs() + daysMs(periodToDays(period));
   if (subscriptionId) {
     try {
       const sub = await stripe.subscriptions.retrieve(subscriptionId);
@@ -295,7 +298,7 @@ app.post("/api/license/verify", async (req, res) => {
 // -------- Checkout --------
 app.get("/buy", async (req, res) => {
   try {
-    const { boundUserKey, plan = "pro", period = "monthly" } = req.query || {};
+    const { boundUserKey, plan = "pro", period = "monthly", payMethod = "card" } = req.query || {};
     if (!boundUserKey) return res.status(400).send("Missing boundUserKey");
 
     if (!stripe) {
@@ -305,32 +308,46 @@ app.get("/buy", async (req, res) => {
       `);
     }
 
-    const priceId =
-      plan === "basic" && period === "monthly" ? process.env.STRIPE_PRICE_BASIC_MONTHLY :
-      plan === "basic" && period === "yearly"  ? process.env.STRIPE_PRICE_BASIC_YEARLY  :
-      plan === "pro"   && period === "yearly"  ? process.env.STRIPE_PRICE_PRO_YEARLY    :
-      process.env.STRIPE_PRICE_PRO_MONTHLY;
+    const method = String(payMethod || "card").toLowerCase();
+    const isPix = method === "pix";
+
+    const priceId = isPix
+      ? (
+        plan === "basic" && period === "monthly" ? process.env.STRIPE_PRICE_BASIC_MONTHLY_ONETIME :
+        plan === "basic" && period === "yearly"  ? process.env.STRIPE_PRICE_BASIC_YEARLY_ONETIME  :
+        plan === "pro"   && period === "yearly"  ? process.env.STRIPE_PRICE_PRO_YEARLY_ONETIME    :
+        process.env.STRIPE_PRICE_PRO_MONTHLY_ONETIME
+      )
+      : (
+        plan === "basic" && period === "monthly" ? process.env.STRIPE_PRICE_BASIC_MONTHLY :
+        plan === "basic" && period === "yearly"  ? process.env.STRIPE_PRICE_BASIC_YEARLY  :
+        plan === "pro"   && period === "yearly"  ? process.env.STRIPE_PRICE_PRO_YEARLY    :
+        process.env.STRIPE_PRICE_PRO_MONTHLY
+      );
 
     if (!priceId) return res.status(400).send("Missing Stripe price id for selected plan/period.");
 
     const baseUrl = `https://${req.get("host")}`;
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
+      mode: isPix ? "payment" : "subscription",
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${baseUrl}/success`,
       cancel_url: `${baseUrl}/cancel`,
-      subscription_data: {
-        metadata: {
-          boundUserKey: String(boundUserKey),
-          plan: String(plan),
-          period: String(period)
+      ...(isPix ? { payment_method_types: ["pix"] } : {
+        subscription_data: {
+          metadata: {
+            boundUserKey: String(boundUserKey),
+            plan: String(plan),
+            period: String(period)
+          }
         }
-      },
+      }),
       metadata: {
         boundUserKey: String(boundUserKey),
         plan: String(plan),
-        period: String(period)
+        period: String(period),
+        payMethod: isPix ? "pix" : "card"
       }
     });
 
