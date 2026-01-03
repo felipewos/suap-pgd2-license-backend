@@ -91,6 +91,51 @@ async function computeStatus(boundUserKey, licenseKey) {
   };
 }
 
+async function processCheckoutSession(session, { force = false } = {}) {
+  const sessionId = session.id;
+  const boundUserKey = session.metadata?.boundUserKey;
+  const plan = session.metadata?.plan || "pro";
+  const period = session.metadata?.period || null;
+  const subscriptionId = session.subscription || null;
+  const customerId = session.customer || null;
+
+  if (!boundUserKey) return { ok: false, reason: "missing boundUserKey" };
+
+  if (!force) {
+    const marked = await markPaymentOnce(`cs:${sessionId}`, {
+      type: "checkout.session.completed",
+      ts: serverTimeMs(),
+      boundUserKey,
+      plan,
+      period,
+      sessionId,
+      subscriptionId,
+      customerId
+    });
+    if (!marked) return { ok: true, duplicate: true };
+  }
+
+  let endsAtMs = serverTimeMs() + daysMs(30);
+  if (subscriptionId) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(subscriptionId);
+      if (sub?.current_period_end) endsAtMs = sub.current_period_end * 1000;
+    } catch { /* ignore */ }
+  }
+
+  const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
+  await createLicense(licenseKey, {
+    status: "active",
+    plan,
+    endsAtMs,
+    boundUserKey,
+    stripe: { sessionId, subscriptionId, customerId, period }
+  });
+
+  await ensureTrialForUser(boundUserKey, null);
+  return { ok: true, licenseKey };
+}
+
 // ---------- Stripe webhook (RAW antes do JSON) ----------
 app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe) return res.status(400).send("Stripe not configured.");
@@ -113,48 +158,8 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
     // 1) checkout concluído (primeira compra)
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-
-      const sessionId = session.id;
-      const boundUserKey = session.metadata?.boundUserKey;
-      const plan = session.metadata?.plan || "pro";
-      const period = session.metadata?.period || null;
-      const subscriptionId = session.subscription || null;
-      const customerId = session.customer || null;
-
-      if (!boundUserKey) return res.json({ received: true, ignored: "missing boundUserKey" });
-
-      if (!await markPaymentOnce(`cs:${sessionId}`, {
-        type: "checkout.session.completed",
-        ts: serverTimeMs(),
-        boundUserKey,
-        plan,
-        period,
-        sessionId,
-        subscriptionId,
-        customerId
-      })) {
-        return res.json({ received: true, duplicate: true });
-      }
-
-      let endsAtMs = serverTimeMs() + daysMs(30);
-      if (subscriptionId) {
-        try {
-          const sub = await stripe.subscriptions.retrieve(subscriptionId);
-          if (sub?.current_period_end) endsAtMs = sub.current_period_end * 1000;
-        } catch { /* ignore */ }
-      }
-
-      const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
-      await createLicense(licenseKey, {
-        status: "active",
-        plan,
-        endsAtMs,
-        boundUserKey,
-        stripe: { sessionId, subscriptionId, customerId, period }
-      });
-
-      await ensureTrialForUser(boundUserKey, null);
-      return res.json({ received: true });
+      const result = await processCheckoutSession(session);
+      return res.json({ received: true, ...result });
     }
 
     // 2) pagamento recorrente ok (renovação)
@@ -344,6 +349,22 @@ app.get("/success", (req, res) => {
 });
 
 app.get("/cancel", (req, res) => res.status(200).send("<h2>Cancelado</h2>"));
+
+// -------- Admin: reprocessar checkout --------
+app.get("/admin/replay-checkout", requireAdmin, async (req, res) => {
+  const sessionId = String(req.query.sessionId || "").trim();
+  const force = String(req.query.force || "").trim() === "1";
+  if (!sessionId) return res.status(400).json({ error: "missing_sessionId" });
+  if (!stripe) return res.status(400).json({ error: "stripe_not_configured" });
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const result = await processCheckoutSession(session, { force });
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
+});
 
 // -------- Seed (manual) - PROTEGIDO --------
 app.get("/admin/create-license", requireAdmin, async (req, res) => {
