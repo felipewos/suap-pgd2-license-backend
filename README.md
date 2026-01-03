@@ -22,6 +22,7 @@ Ou via endpoint:
 - GET /admin/create-license?plan=basic&days=30
 
 ## Produção
+- Prioridade de plano: Pro > Basico; em empate, maior validade.
 - Use `DATABASE_URL` para Postgres (JSON so para dev local).
 - Configure CORS allowlist.
 - Configure Stripe (opcional) + webhook.
