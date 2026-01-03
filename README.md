@@ -22,6 +22,6 @@ Ou via endpoint:
 - GET /admin/create-license?plan=basic&days=30
 
 ## Produção
-- Troque `db.js` (JSON) por Postgres/SQLite.
+- Use `DATABASE_URL` para Postgres (JSON so para dev local).
 - Configure CORS allowlist.
 - Configure Stripe (opcional) + webhook.

@@ -3,14 +3,13 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import {
-  getDb,
-  putDb,
   getUser,
   upsertUser,
   getLicense,
   createLicense,
   bindLicenseToUser,
-  getActiveLicenseForUser
+  getActiveLicenseForUser,
+  markPaymentOnce
 } from "./db.js";
 import { stripe } from "./stripe_client.js";
 
@@ -56,22 +55,22 @@ function getTrialDays() {
   return 7;
 }
 
-function ensureTrialForUser(boundUserKey, boundUserLabel) {
-  const existing = getUser(boundUserKey);
+async function ensureTrialForUser(boundUserKey, boundUserLabel) {
+  const existing = await getUser(boundUserKey);
   if (existing?.trialStartedAt && existing?.trialEndsAt != null) return existing;
 
   const now = serverTimeMs();
   const ends = now + daysMs(getTrialDays());
-  return upsertUser(boundUserKey, {
+  return await upsertUser(boundUserKey, {
     boundUserLabel: boundUserLabel || null,
     trialStartedAt: now,
     trialEndsAt: ends
   });
 }
 
-function computeStatus(boundUserKey, licenseKey) {
+async function computeStatus(boundUserKey, licenseKey) {
   const now = serverTimeMs();
-  const u = getUser(boundUserKey) || null;
+  const u = await getUser(boundUserKey) || null;
 
   const trialEndsAtMs = u?.trialEndsAt ?? null;
   const trialActive = !!trialEndsAtMs && trialEndsAtMs > now;
@@ -79,8 +78,8 @@ function computeStatus(boundUserKey, licenseKey) {
   let lic = null;
 
   // se veio uma chave explícita, usa ela; senão tenta por usuário (compra automática via webhook)
-  if (licenseKey) lic = getLicense(licenseKey);
-  else lic = getActiveLicenseForUser(boundUserKey, now);
+  if (licenseKey) lic = await getLicense(licenseKey);
+  else lic = await getActiveLicenseForUser(boundUserKey, now);
 
   const licenseActive = !!lic?.endsAtMs && lic.endsAtMs > now && lic.status === "active";
   const plan = lic?.plan || null;
@@ -105,19 +104,11 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, secret);
   } catch (err) {
-    return res.status(400).send(Webhook Error: ${err.message});
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
     // idempotência simples no db.json (evita duplicar licenças em retries)
-    const markOnce = (key, payload) => {
-      const db = getDb();
-      db.payments = db.payments || {};
-      if (db.payments[key]) return false;
-      db.payments[key] = payload;
-      putDb(db);
-      return true;
-    };
 
     // 1) checkout concluído (primeira compra)
     if (event.type === "checkout.session.completed") {
@@ -132,7 +123,7 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
 
       if (!boundUserKey) return res.json({ received: true, ignored: "missing boundUserKey" });
 
-      if (!markOnce(cs:${sessionId}, {
+      if (!await markPaymentOnce(`cs:${sessionId}`, {
         type: "checkout.session.completed",
         ts: serverTimeMs(),
         boundUserKey,
@@ -154,7 +145,7 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
       }
 
       const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
-      createLicense(licenseKey, {
+      await createLicense(licenseKey, {
         status: "active",
         plan,
         endsAtMs,
@@ -162,7 +153,7 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
         stripe: { sessionId, subscriptionId, customerId, period }
       });
 
-      ensureTrialForUser(boundUserKey, null);
+      await ensureTrialForUser(boundUserKey, null);
       return res.json({ received: true });
     }
 
@@ -172,7 +163,7 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
       const invoiceId = invoice.id;
       const subscriptionId = invoice.subscription || null;
 
-      if (!markOnce(in:${invoiceId}, {
+      if (!await markPaymentOnce(`in:${invoiceId}`, {
         type: "invoice.payment_succeeded",
         ts: serverTimeMs(),
         invoiceId,
@@ -198,39 +189,33 @@ app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async
       if (!boundUserKey || !endsAtMs) return res.json({ received: true, ignored: "missing metadata/endsAt" });
 
       const now = serverTimeMs();
-      const best = getActiveLicenseForUser(boundUserKey, now);
+      const best = await getActiveLicenseForUser(boundUserKey, now);
 
-      const db = getDb();
-      db.licenses = db.licenses || {};
-
-      if (best?.licenseKey && db.licenses[best.licenseKey]) {
-        db.licenses[best.licenseKey] = {
-          ...db.licenses[best.licenseKey],
+      if (best?.licenseKey) {
+        await createLicense(best.licenseKey, {
           status: "active",
           plan,
           endsAtMs,
           boundUserKey,
           stripe: { subscriptionId, customerId: sub.customer || null, period }
-        };
+        });
       } else {
         const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
-        db.licenses[licenseKey] = {
+        await createLicense(licenseKey, {
           status: "active",
           plan,
           endsAtMs,
           boundUserKey,
           stripe: { subscriptionId, customerId: sub.customer || null, period }
-        };
+        });
       }
-
-      putDb(db);
-      ensureTrialForUser(boundUserKey, null);
+      await ensureTrialForUser(boundUserKey, null);
       return res.json({ received: true });
     }
 
     return res.json({ received: true });
   } catch (e) {
-    return res.status(500).send(Webhook handler error: ${e?.message || e});
+    return res.status(500).send(`Webhook handler error: ${e?.message || e}`);
   }
 });
 
@@ -264,41 +249,41 @@ function requireAdmin(req, res, next) {
 app.get("/healthz", (req, res) => res.json({ ok: true, ts: serverTimeMs() }));
 
 // -------- API --------
-app.post("/api/auth/bind", (req, res) => {
+app.post("/api/auth/bind", async (req, res) => {
   const { boundUserKey, boundUserLabel } = req.body || {};
   if (!boundUserKey) return res.status(400).json({ error: "missing boundUserKey" });
 
-  ensureTrialForUser(boundUserKey, boundUserLabel);
-  return res.json(computeStatus(boundUserKey, null));
+  await ensureTrialForUser(boundUserKey, boundUserLabel);
+  return res.json(await computeStatus(boundUserKey, null));
 });
 
-app.post("/api/trial/status", (req, res) => {
+app.post("/api/trial/status", async (req, res) => {
   const { boundUserKey } = req.body || {};
   if (!boundUserKey) return res.status(400).json({ error: "missing boundUserKey" });
 
-  const u = getUser(boundUserKey);
+  const u = await getUser(boundUserKey);
   if (!u) return res.status(404).json({ error: "not_found" });
 
-  return res.json(computeStatus(boundUserKey, null));
+  return res.json(await computeStatus(boundUserKey, null));
 });
 
-app.post("/api/license/verify", (req, res) => {
+app.post("/api/license/verify", async (req, res) => {
   const { boundUserKey, licenseKey } = req.body || {};
   if (!boundUserKey) return res.status(400).json({ error: "missing boundUserKey" });
   if (!licenseKey) return res.status(400).json({ error: "missing licenseKey" });
 
-  ensureTrialForUser(boundUserKey, null);
+  await ensureTrialForUser(boundUserKey, null);
 
-  const lic = getLicense(licenseKey);
+  const lic = await getLicense(licenseKey);
   if (!lic) return res.status(404).json({ error: "license_not_found" });
 
   if (lic.boundUserKey && lic.boundUserKey !== boundUserKey) {
     return res.status(403).json({ error: "license_bound_to_other_user" });
   }
 
-  if (!lic.boundUserKey) bindLicenseToUser(licenseKey, boundUserKey);
+  if (!lic.boundUserKey) await bindLicenseToUser(licenseKey, boundUserKey);
 
-  return res.json(computeStatus(boundUserKey, licenseKey));
+  return res.json(await computeStatus(boundUserKey, licenseKey));
 });
 
 // -------- Checkout --------
@@ -322,13 +307,13 @@ app.get("/buy", async (req, res) => {
 
     if (!priceId) return res.status(400).send("Missing Stripe price id for selected plan/period.");
 
-    const baseUrl = https://${req.get("host")};
+    const baseUrl = `https://${req.get("host")}`;
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: ${baseUrl}/success,
-      cancel_url: ${baseUrl}/cancel,
+      success_url: `${baseUrl}/success`,
+      cancel_url: `${baseUrl}/cancel`,
       subscription_data: {
         metadata: {
           boundUserKey: String(boundUserKey),
@@ -361,14 +346,14 @@ app.get("/success", (req, res) => {
 app.get("/cancel", (req, res) => res.status(200).send("<h2>Cancelado</h2>"));
 
 // -------- Seed (manual) - PROTEGIDO --------
-app.get("/admin/create-license", requireAdmin, (req, res) => {
+app.get("/admin/create-license", requireAdmin, async (req, res) => {
   const { plan = "pro", days = "30" } = req.query || {};
   const d = Number(days);
   const now = serverTimeMs();
   const endsAtMs = now + daysMs(Number.isFinite(d) ? d : 30);
   const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
 
-  createLicense(licenseKey, { status: "active", plan, endsAtMs, boundUserKey: null });
+  await createLicense(licenseKey, { status: "active", plan, endsAtMs, boundUserKey: null });
   return res.json({ licenseKey, plan, endsAtMs });
 });
 

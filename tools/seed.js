@@ -8,7 +8,7 @@ const now = Date.now();
 const endsAtMs = now + (Number.isFinite(days) ? days : 30) * 24 * 60 * 60 * 1000;
 const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
 
-createLicense(licenseKey, { status:"active", plan, endsAtMs, boundUserKey: null });
+await createLicense(licenseKey, { status: "active", plan, endsAtMs, boundUserKey: null });
 console.log("LICENSE_KEY:", licenseKey);
 console.log("PLAN:", plan);
 console.log("ENDS:", new Date(endsAtMs).toISOString());
