@@ -330,19 +330,11 @@ app.get("/buy", async (req, res) => {
     const baseUrl = `https://${req.get("host")}`;
 
     const session = await stripe.checkout.sessions.create({
-      mode: isPix ? "payment" : "subscription",
+      mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${baseUrl}/success`,
       cancel_url: `${baseUrl}/cancel`,
-      ...(isPix ? { payment_method_types: ["pix"] } : {
-        subscription_data: {
-          metadata: {
-            boundUserKey: String(boundUserKey),
-            plan: String(plan),
-            period: String(period)
-          }
-        }
-      }),
+      ...(isPix ? { payment_method_types: ["pix"] } : {}),
       metadata: {
         boundUserKey: String(boundUserKey),
         plan: String(plan),
