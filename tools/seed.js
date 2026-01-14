@@ -1,4 +1,4 @@
-// tools/seed.js — gera uma licença manual (sem Stripe)
+﻿// tools/seed.js - gera uma licença manual (sem pagamento)
 import crypto from "crypto";
 import { createLicense } from "../db.js";
 

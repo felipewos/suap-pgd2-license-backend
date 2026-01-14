@@ -1,4 +1,4 @@
-// server.js
+﻿// server.js
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -12,7 +12,7 @@ import {
   markPaymentOnce,
   getStats
 } from "./db.js";
-import { stripe } from "./stripe_client.js";
+import { mpPayment, mpPreference } from "./mercadopago_client.js";
 
 const app = express();
 
@@ -45,12 +45,61 @@ app.use(cors({
 }));
 
 app.options("*", cors());
+app.use(express.json({ limit: "512kb" }));
 
 // ---------- Helpers ----------
 function serverTimeMs() { return Date.now(); }
 function daysMs(d) { return d * 24 * 60 * 60 * 1000; }
 function periodToDays(period) {
   return String(period || "").toLowerCase() === "yearly" ? 365 : 30;
+}
+function normalizePlan(plan) {
+  const p = String(plan || "").toLowerCase();
+  return p === "basic" || p === "pro" ? p : "pro";
+}
+function normalizePeriod(period) {
+  return String(period || "").toLowerCase() === "yearly" ? "yearly" : "monthly";
+}
+function readMoneyEnv(key, fallback) {
+  const raw = String(process.env[key] || "").trim();
+  if (!raw) return fallback;
+  const n = Number(raw.replace(",", "."));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const PRICE_DEFAULTS = {
+  basic_monthly: 14.99,
+  basic_yearly: 119.88,
+  pro_monthly: 19.99,
+  pro_yearly: 179.88
+};
+function getPrice(plan, period) {
+  const p = normalizePlan(plan);
+  const per = normalizePeriod(period);
+  const envKey = `MP_PRICE_${p.toUpperCase()}_${per.toUpperCase()}`;
+  const fallback = PRICE_DEFAULTS[`${p}_${per}`];
+  return readMoneyEnv(envKey, fallback);
+}
+function getPublicBaseUrl(req) {
+  const base = String(process.env.PUBLIC_BASE_URL || "").trim();
+  if (base) return base.replace(/\/+$/, "");
+  return `https://${req.get("host")}`;
+}
+function buildExternalReference(meta) {
+  return JSON.stringify(meta);
+}
+function parseExternalReference(ref) {
+  if (!ref) return {};
+  const raw = String(ref);
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    const parts = raw.split("|");
+    if (parts.length >= 3) {
+      return { boundUserKey: parts[0], plan: parts[1], period: parts[2] };
+    }
+  }
+  return {};
 }
 
 function getTrialDays() {
@@ -95,141 +144,75 @@ async function computeStatus(boundUserKey, licenseKey) {
   };
 }
 
-async function processCheckoutSession(session, { force = false } = {}) {
-  const sessionId = session.id;
-  const boundUserKey = session.metadata?.boundUserKey;
-  const plan = session.metadata?.plan || "pro";
-  const period = session.metadata?.period || null;
-  const subscriptionId = session.subscription || null;
-  const customerId = session.customer || null;
+async function processPayment(payment, { force = false } = {}) {
+  const paymentId = payment?.id || null;
+  if (!paymentId) return { ok: false, reason: "missing_payment_id" };
 
-  if (!boundUserKey) return { ok: false, reason: "missing boundUserKey" };
+  const status = String(payment?.status || "").toLowerCase();
+  if (status !== "approved") return { ok: true, ignored: "not_approved", status };
+
+  const meta = payment?.metadata || {};
+  const ref = parseExternalReference(payment?.external_reference);
+  const boundUserKey = meta.boundUserKey || meta.bound_user_key || ref.boundUserKey || ref.bound_user_key || null;
+  if (!boundUserKey) return { ok: false, reason: "missing_boundUserKey" };
+
+  const plan = normalizePlan(meta.plan || ref.plan || "pro");
+  const period = normalizePeriod(meta.period || ref.period || "monthly");
 
   if (!force) {
-    const marked = await markPaymentOnce(`cs:${sessionId}`, {
-      type: "checkout.session.completed",
+    const marked = await markPaymentOnce(`mp:${paymentId}`, {
+      type: "mercadopago.payment.approved",
       ts: serverTimeMs(),
       boundUserKey,
       plan,
       period,
-      sessionId,
-      subscriptionId,
-      customerId
+      sessionId: String(paymentId)
     });
     if (!marked) return { ok: true, duplicate: true };
   }
 
-  let endsAtMs = serverTimeMs() + daysMs(periodToDays(period));
-  if (subscriptionId) {
-    try {
-      const sub = await stripe.subscriptions.retrieve(subscriptionId);
-      if (sub?.current_period_end) endsAtMs = sub.current_period_end * 1000;
-    } catch { /* ignore */ }
-  }
-
+  const endsAtMs = serverTimeMs() + daysMs(periodToDays(period));
   const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
   await createLicense(licenseKey, {
     status: "active",
     plan,
     endsAtMs,
     boundUserKey,
-    stripe: { sessionId, subscriptionId, customerId, period }
+    stripe: { sessionId: `mp:${paymentId}`, period }
   });
 
   await ensureTrialForUser(boundUserKey, null);
   return { ok: true, licenseKey };
 }
 
-// ---------- Stripe webhook (RAW antes do JSON) ----------
-app.post("/api/webhook/stripe", express.raw({ type: "application/json" }), async (req, res) => {
-  if (!stripe) return res.status(400).send("Stripe not configured.");
+// ---------- Mercado Pago webhook ----------
+app.post("/api/webhook/mercadopago", async (req, res) => {
+  if (!mpPayment) return res.status(400).send("Mercado Pago not configured.");
 
-  const sig = req.headers["stripe-signature"];
-  const secret = process.env.STRIPE_WEBHOOK_SECRET;
-  if (!secret) return res.status(400).send("Missing STRIPE_WEBHOOK_SECRET");
-  if (!sig) return res.status(400).send("Missing stripe-signature header");
+  const body = req.body || {};
+  const query = req.query || {};
+  const eventType = String(body.type || body.topic || query.type || query.topic || "").toLowerCase();
+  const paymentId =
+    body?.data?.id ||
+    body?.id ||
+    query?.id ||
+    query?.["data.id"] ||
+    query?.["data[id]"];
 
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, secret);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+  if (eventType && eventType !== "payment") {
+    return res.json({ received: true, ignored: "not_payment" });
   }
+  if (!paymentId) return res.json({ received: true, ignored: "missing_payment_id" });
 
   try {
-    // idempotência simples no db.json (evita duplicar licenças em retries)
-
-    // 1) checkout concluído (primeira compra)
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const result = await processCheckoutSession(session);
-      return res.json({ received: true, ...result });
-    }
-
-    // 2) pagamento recorrente ok (renovação)
-    if (event.type === "invoice.payment_succeeded") {
-      const invoice = event.data.object;
-      const invoiceId = invoice.id;
-      const subscriptionId = invoice.subscription || null;
-
-      if (!await markPaymentOnce(`in:${invoiceId}`, {
-        type: "invoice.payment_succeeded",
-        ts: serverTimeMs(),
-        invoiceId,
-        subscriptionId
-      })) {
-        return res.json({ received: true, duplicate: true });
-      }
-
-      if (!subscriptionId) return res.json({ received: true, ignored: "no subscription" });
-
-      let sub;
-      try {
-        sub = await stripe.subscriptions.retrieve(subscriptionId);
-      } catch {
-        return res.json({ received: true, ignored: "sub retrieve failed" });
-      }
-
-      const boundUserKey = sub?.metadata?.boundUserKey || null;
-      const plan = sub?.metadata?.plan || "pro";
-      const period = sub?.metadata?.period || null;
-      const endsAtMs = sub?.current_period_end ? sub.current_period_end * 1000 : null;
-
-      if (!boundUserKey || !endsAtMs) return res.json({ received: true, ignored: "missing metadata/endsAt" });
-
-      const now = serverTimeMs();
-      const best = await getActiveLicenseForUser(boundUserKey, now);
-
-      if (best?.licenseKey) {
-        await createLicense(best.licenseKey, {
-          status: "active",
-          plan,
-          endsAtMs,
-          boundUserKey,
-          stripe: { subscriptionId, customerId: sub.customer || null, period }
-        });
-      } else {
-        const licenseKey = crypto.randomBytes(10).toString("hex").toUpperCase();
-        await createLicense(licenseKey, {
-          status: "active",
-          plan,
-          endsAtMs,
-          boundUserKey,
-          stripe: { subscriptionId, customerId: sub.customer || null, period }
-        });
-      }
-      await ensureTrialForUser(boundUserKey, null);
-      return res.json({ received: true });
-    }
-
-    return res.json({ received: true });
-  } catch (e) {
-    return res.status(500).send(`Webhook handler error: ${e?.message || e}`);
+    const resp = await mpPayment.get({ id: paymentId });
+    const payment = resp?.body || resp;
+    const result = await processPayment(payment);
+    return res.json({ received: true, ...result });
+  } catch (err) {
+    return res.status(500).send(`Webhook handler error: ${err?.message || err}`);
   }
 });
-
-// depois do webhook, pode JSON normal
-app.use(express.json({ limit: "512kb" }));
 
 // ---------- Admin auth ----------
 function safeEqual(a, b) {
@@ -298,52 +281,60 @@ app.post("/api/license/verify", async (req, res) => {
 // -------- Checkout --------
 app.get("/buy", async (req, res) => {
   try {
-    const { boundUserKey, plan = "pro", period = "monthly", payMethod = "card" } = req.query || {};
+    const { boundUserKey } = req.query || {};
     if (!boundUserKey) return res.status(400).send("Missing boundUserKey");
 
-    if (!stripe) {
+    if (!mpPreference) {
       return res.status(200).send(`
-        <h2>Checkout desativado (Stripe não configurado)</h2>
-        <p>Configure STRIPE_SECRET_KEY e os PRICE IDs no .env.</p>
+        <h2>Checkout desativado (Mercado Pago não configurado)</h2>
+        <p>Configure MERCADOPAGO_ACCESS_TOKEN no .env.</p>
       `);
     }
 
-    const method = String(payMethod || "card").toLowerCase();
-    const isPix = method === "pix";
+    const plan = normalizePlan(req.query?.plan || "pro");
+    const period = normalizePeriod(req.query?.period || "monthly");
+    const amount = getPrice(plan, period);
+    const baseUrl = getPublicBaseUrl(req);
+    const labelPlan = plan === "basic" ? "Básico" : "Pro";
+    const labelPeriod = period === "yearly" ? "1 ano" : "30 dias";
 
-    const priceId = isPix
-      ? (
-        plan === "basic" && period === "monthly" ? process.env.STRIPE_PRICE_BASIC_MONTHLY_ONETIME :
-        plan === "basic" && period === "yearly"  ? process.env.STRIPE_PRICE_BASIC_YEARLY_ONETIME  :
-        plan === "pro"   && period === "yearly"  ? process.env.STRIPE_PRICE_PRO_YEARLY_ONETIME    :
-        process.env.STRIPE_PRICE_PRO_MONTHLY_ONETIME
-      )
-      : (
-        plan === "basic" && period === "monthly" ? process.env.STRIPE_PRICE_BASIC_MONTHLY :
-        plan === "basic" && period === "yearly"  ? process.env.STRIPE_PRICE_BASIC_YEARLY  :
-        plan === "pro"   && period === "yearly"  ? process.env.STRIPE_PRICE_PRO_YEARLY    :
-        process.env.STRIPE_PRICE_PRO_MONTHLY
-      );
+    const externalReference = buildExternalReference({
+      boundUserKey: String(boundUserKey),
+      plan,
+      period
+    });
 
-    if (!priceId) return res.status(400).send("Missing Stripe price id for selected plan/period.");
-
-    const baseUrl = `https://${req.get("host")}`;
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${baseUrl}/success`,
-      cancel_url: `${baseUrl}/cancel`,
-      ...(isPix ? { payment_method_types: ["pix"] } : {}),
-      metadata: {
-        boundUserKey: String(boundUserKey),
-        plan: String(plan),
-        period: String(period),
-        payMethod: isPix ? "pix" : "card"
+    const preference = await mpPreference.create({
+      body: {
+        items: [
+          {
+            id: `suap-pgd2-${plan}-${period}`,
+            title: `SUAP PGD2 PIT/RIT ${labelPlan} - ${labelPeriod}`,
+            quantity: 1,
+            currency_id: "BRL",
+            unit_price: amount
+          }
+        ],
+        auto_return: "approved",
+        back_urls: {
+          success: `${baseUrl}/success`,
+          pending: `${baseUrl}/pending`,
+          failure: `${baseUrl}/cancel`
+        },
+        notification_url: `${baseUrl}/api/webhook/mercadopago`,
+        external_reference: externalReference,
+        metadata: { boundUserKey: String(boundUserKey), plan, period }
       }
     });
 
-    return res.redirect(303, session.url);
+    const initPoint =
+      preference?.body?.init_point ||
+      preference?.init_point ||
+      preference?.body?.sandbox_init_point ||
+      preference?.sandbox_init_point;
+
+    if (!initPoint) return res.status(500).send("Buy error: missing Mercado Pago init_point.");
+    return res.redirect(303, initPoint);
   } catch (err) {
     console.error("BUY_ERROR", err);
     return res.status(500).send("Buy error: " + (err?.message || err));
@@ -353,23 +344,32 @@ app.get("/buy", async (req, res) => {
 app.get("/success", (req, res) => {
   res.status(200).send(`
     <h2>Pagamento iniciado</h2>
-    <p>Assim que o Stripe confirmar, sua licença será ativada automaticamente no backend.</p>
-    <p>Volte ao Chrome e clique em “Verificar status”.</p>
+    <p>Assim que o Mercado Pago confirmar, sua licença será ativada automaticamente no backend.</p>
+    <p>Volte ao Chrome e clique em "Verificar status".</p>
+  `);
+});
+
+app.get("/pending", (req, res) => {
+  res.status(200).send(`
+    <h2>Pagamento pendente</h2>
+    <p>Assim que o Mercado Pago confirmar, sua licença será ativada automaticamente no backend.</p>
+    <p>Volte ao Chrome e clique em "Verificar status".</p>
   `);
 });
 
 app.get("/cancel", (req, res) => res.status(200).send("<h2>Cancelado</h2>"));
 
-// -------- Admin: reprocessar checkout --------
-app.get("/admin/replay-checkout", requireAdmin, async (req, res) => {
-  const sessionId = String(req.query.sessionId || "").trim();
+// -------- Admin: reprocessar pagamento --------
+app.get("/admin/replay-payment", requireAdmin, async (req, res) => {
+  const paymentId = String(req.query.paymentId || "").trim();
   const force = String(req.query.force || "").trim() === "1";
-  if (!sessionId) return res.status(400).json({ error: "missing_sessionId" });
-  if (!stripe) return res.status(400).json({ error: "stripe_not_configured" });
+  if (!paymentId) return res.status(400).json({ error: "missing_paymentId" });
+  if (!mpPayment) return res.status(400).json({ error: "mercadopago_not_configured" });
 
   try {
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-    const result = await processCheckoutSession(session, { force });
+    const resp = await mpPayment.get({ id: paymentId });
+    const payment = resp?.body || resp;
+    const result = await processPayment(payment, { force });
     return res.json(result);
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
@@ -396,3 +396,4 @@ app.get("/admin/stats", requireAdmin, async (req, res) => {
 
 const port = Number(process.env.PORT || "8787");
 app.listen(port, () => console.log("License backend listening on", port));
+

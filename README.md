@@ -1,4 +1,4 @@
-# Backend de licença / trial (SUAP PGD2 PIT/RIT)
+﻿# Backend de licença / trial (SUAP PGD2 PIT/RIT)
 
 ## Rodar local
 
@@ -11,7 +11,16 @@ npm start
 
 Servidor padrão: http://localhost:8787
 
-## Testar criando licença manual (sem Stripe)
+## Checkout (Mercado Pago)
+- Endpoint de compra: `GET /buy?boundUserKey=...&plan=basic|pro&period=monthly|yearly`
+- Webhook: `POST /api/webhook/mercadopago`
+- URLs de retorno: `/success`, `/pending`, `/cancel`
+
+## Preços
+- `MP_PRICE_BASIC_MONTHLY`, `MP_PRICE_PRO_MONTHLY`
+- `MP_PRICE_BASIC_YEARLY`, `MP_PRICE_PRO_YEARLY`
+
+## Testar criando licença manual (sem pagamento)
 
 ```bash
 npm run seed -- pro 30
@@ -22,15 +31,12 @@ Ou via endpoint:
 - GET /admin/create-license?plan=basic&days=30
 
 ## Produção
-- Prioridade de plano: Pro > Basico; em empate, maior validade.
+- Prioridade de plano: Pro > Básico; em empate, maior validade.
 - Use `DATABASE_URL` para Postgres (JSON so para dev local).
 - Configure CORS allowlist.
-- Configure Stripe (opcional) + webhook.
+- Configure `MERCADOPAGO_ACCESS_TOKEN`.
+- Opcional: configure `PUBLIC_BASE_URL` para gerar URLs do webhook/retorno.
 
 ## Admin
 - GET /admin/stats (total usuarios trial/pago e licencas ativas)
-
-
-## Pix
-- Pix funciona via pagamento unico (sem assinatura).
-- Configure os PRICE IDs *_ONETIME no .env para Pix.
+- GET /admin/replay-payment?paymentId=...&force=1 (reprocessa pagamento aprovado)
