@@ -1,42 +1,42 @@
-﻿# Backend de licença / trial (SUAP PGD2 PIT/RIT)
+# suap-pgd2-license-backend
+
+Backend de trial e licenciamento da extensao `suap-pgd2-extension`, com verificacao de acesso e fluxo de compra.
 
 ## Rodar local
 
 ```bash
-cd backend
 cp .env.example .env
 npm install
 npm start
 ```
 
-Servidor padrão: http://localhost:8787
+Servidor padrao: `http://localhost:8787`
 
-## Checkout (Mercado Pago)
-- Endpoint de compra: `GET /buy?boundUserKey=...&plan=basic|pro&period=monthly|yearly`
-- Webhook: `POST /api/webhook/mercadopago`
-- URLs de retorno: `/success`, `/pending`, `/cancel`
+## Rotas principais
 
-## Preços
-- `MP_PRICE_BASIC_MONTHLY`, `MP_PRICE_PRO_MONTHLY`
-- `MP_PRICE_BASIC_YEARLY`, `MP_PRICE_PRO_YEARLY`
+- `POST /api/auth/bind`
+- `POST /api/trial/status`
+- `POST /api/license/verify`
+- `GET /buy`
+- `POST /api/webhook/mercadopago`
 
-## Testar criando licença manual (sem pagamento)
+## Licencas de teste
 
 ```bash
 npm run seed -- pro 30
-# copie a LICENSE_KEY e cole no popup/options
 ```
 
-Ou via endpoint:
-- GET /admin/create-license?plan=basic&days=30
+Isso gera uma `LICENSE_KEY` para testar ativacao manual na extensao.
 
-## Produção
-- Prioridade de plano: Pro > Básico; em empate, maior validade.
-- Use `DATABASE_URL` para Postgres (JSON so para dev local).
-- Configure CORS allowlist.
-- Configure `MERCADOPAGO_ACCESS_TOKEN`.
-- Opcional: configure `PUBLIC_BASE_URL` para gerar URLs do webhook/retorno.
+## Ambiente
+
+Configure no minimo:
+
+- `DATABASE_URL` para Postgres em producao
+- `MERCADOPAGO_ACCESS_TOKEN`
+- `PUBLIC_BASE_URL` quando precisar gerar URLs absolutas
 
 ## Admin
-- GET /admin/stats (total usuarios trial/pago e licencas ativas)
-- GET /admin/replay-payment?paymentId=...&force=1 (reprocessa pagamento aprovado)
+
+- `GET /admin/stats`
+- `GET /admin/replay-payment?paymentId=...&force=1`
